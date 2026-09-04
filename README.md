@@ -110,6 +110,21 @@ The registry is the whole trick. Instead of the buyer agent knowing how to talk 
 | Access / extension code | `authToken` (stored encrypted, never re-shown after save) |
 | Optional listed contact | `contactPhone` |
 
+ 
+The Buyer Agent's **Merchant Registry** is the **Contacts app**. Nothing can be called until it's saved here.
+ 
+```mermaid
+flowchart LR
+    CARD["🪪 merchant_manifest.json<br/>(AgentInfo.jsx business card)"] -->|"copy / paste"| ADD["➕ 'Add Contact'<br/>Registry paste-box UI"]
+    ADD --> STORE[("📇 Merchant Registry<br/>name · agentUrl · authToken(encrypted) · contactPhone")]
+    STORE -->|"lookup by name"| DIAL["📞 Buyer Agent 'dials'<br/>POST {agentUrl}/agent/message<br/>Authorization: Bearer authToken"]
+ 
+    style CARD fill:#fef9c3
+    style ADD fill:#dbeafe
+    style STORE fill:#dcfce7,stroke:#15803d,stroke-width:2px
+    style DIAL fill:#fecaca,stroke:#dc2626,stroke-width:2px
+```
+
 **How a merchant gets listed:**
 
 1. The merchant runs `merchant-agent-core` (see [Merchant-Side Repository](#-merchant-side-repository)) and exposes its manifest — the same `merchant_manifest.json` / `AgentInfo.jsx` page a shop owner copies from.
@@ -414,3 +429,60 @@ That repo contains:
 - Merchant side: [`Ecommerce-App`](https://github.com/Sachin-MR05/Ecommerce-App)
 - Buyer side (this repo): [`Buyer_agent`](https://github.com/Sachin-MR05/Buyer_agent)
 
+---
+##  **About Me**
+
+<div align="center">
+  <img src="https://readme-typing-svg.demolab.com?font=Poppins&weight=600&size=24&duration=2800&pause=900&color=0F766E&center=true&vCenter=true&width=720&lines=AI+%26+Machine+Learning+Enthusiast;Building+Intelligent+Systems+for+Real-World+Impact" alt="Sachin typing introduction" />
+</div>
+
+<p align="center">
+  <strong>SACHIN M R</strong> - Passionate AI &amp; Machine Learning Enthusiast
+</p>
+
+<p align="center">
+  I am dedicated to harnessing the power of <strong>Artificial Intelligence</strong> to make people's lives easier and enable autonomous systems across every field. My journey involves deep learning, machine learning, and AI agents.
+</p>
+
+<div align="center">
+
+### **Current Focus**
+
+</div>
+
+<p align="center">
+  📚 <strong>Learning &amp; mastering Deep Learning architectures</strong><br>
+  🤖 <strong>Building AI Agents with advanced reasoning capabilities</strong><br>
+  🌍 <strong>Creating autonomous systems for real-world problems</strong><br>
+  🛰️ <strong>Satellite imagery analysis &amp; geospatial AI applications</strong>
+</p>
+
+<div align="center">
+
+### **Connect & Follow**
+
+  <a href="https://www.linkedin.com/in/mr-sachin">
+    <img src="https://img.shields.io/badge/LinkedIn-mr--sachin-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white" alt="LinkedIn">
+  </a>
+  <a href="https://github.com/Sachin-MR05">
+    <img src="https://img.shields.io/badge/GitHub-Sachin--MR05-181717?style=for-the-badge&logo=github&logoColor=white" alt="GitHub">
+  </a>
+  <a href="https://huggingface.co/mr-sachin">
+    <img src="https://img.shields.io/badge/Hugging%20Face-mr--sachin-FFB000?style=for-the-badge&logo=huggingface&logoColor=black" alt="Hugging Face">
+  </a>
+
+</div>
+
+<p align="center">
+  Eager to connect for collaborations, internships, and meaningful technical discussions.
+</p>
+
+---
+
+<div align="center">
+
+### **Made with ❤️ by Sachin**
+
+*Empowering autonomous systems for a better future*
+
+</div>
