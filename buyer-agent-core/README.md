@@ -6,170 +6,97 @@ Executor-enforces split - except this agent's tools are "search the local
 merchant registry" and "call another agent's `/agent/message` endpoint"
 instead of "call the Java Tool Layer."
 
-## Architecture
 
-```
-User (chat UI)
-      |
-      v
-POST /buyer/chat  { chatId?, message }
-      v
-BuyerAgent.run(chat_id, message)   -- per-chat state, like MerchantAgent's session history
-      v
-AgentLoop (think -> act -> observe):
-   Planner.decide(state) -> LLM -> Decision
-   action in SEARCH_MERCHANTS | CONTACT_MERCHANTS | PRESENT_OFFERS
-           | ASK_USER | CHECKOUT | CONFIRM_PAYMENT | FINAL_RESPONSE
-   Executor.execute(decision, state):
-      - SEARCH_MERCHANTS  -> RegistryTool (local, no network)
-      - CONTACT_MERCHANTS -> MerchantClient.send_to_many() (parallel HTTP,
-                              one thread per shop, each bounded by its own
-                              timeout so one slow shop never blocks the rest)
-      - CHECKOUT           -> gated: only runs if state.chat.awaiting_confirmation
-                              is True, which is only ever set by a prior
-                              PRESENT_OFFERS step (see Executor._require_checkout_authorized)
-      - CONFIRM_PAYMENT    -> gated: only runs if a checkout is actually
-                              AWAITING_PAYMENT for this chat
-   loop again with the real observation until a terminal status
-```
 
-Every call to a merchant uses the exact wire contract merchant-agent-core's
-`app/gateway/routes.py` exposes:
+Every one of these is a branch the `AgentLoop` / `Decision Layer` has to handle — not just the "happy path" shown above.
 
-```
-POST {agentUrl}
-Authorization: {authToken}
-{ "requestId": "...", "sessionId": "...", "userId": "...", "message": "...", "channel": "api" }
--> { "requestId", "status", "message", "data", "error" }
-```
+```mermaid
+flowchart TD
+    START["User message received"] --> A{"Merchant identified?"}
+    A -->|"no"| A1["Ask user to name merchant or category<br/>status=WAITING_FOR_USER"]
+    A -->|"yes, in registry"| B{"Merchant reachable?"}
+    A -->|"yes, NOT in registry"| A2["Tell user this shop isn't registered yet<br/>(needs to be added via Registry UI)"]
 
-No merchant-side changes are needed - any shop running that repo's
-merchant-agent-core already accepts this.
+    B -->|"timeout / connection error"| B1["Report failure to user,<br/>offer to retry or try another shop"]
+    B -->|"auth token invalid/expired"| B2["Report registry/config issue,<br/>do not retry silently"]
+    B -->|"reachable"| C{"Item available?"}
 
-## Why it stays fast
+    C -->|"out of stock"| C1["Relay 'not available',<br/>offer to search other registered shops"]
+    C -->|"ambiguous match (multiple SKUs)"| C2["Ask merchant follow-up<br/>or ask user to disambiguate"]
+    C -->|"in stock"| D["Present offer to user"]
 
-- **Parallel fan-out.** `MerchantClient.send_to_many()` contacts every
-  shortlisted merchant concurrently (`ThreadPoolExecutor`, capped by
-  `MAX_PARALLEL_MERCHANTS`), so comparing 4 shops takes as long as the
-  slowest one, not the sum of all four.
-- **Short per-call timeouts.** `MERCHANT_TIMEOUT_SECONDS` (default 12s) is
-  a hard ceiling per shop - a dead or slow merchant becomes a FAILED
-  MerchantReply instead of stalling the whole comparison.
-- **Local, network-free registry matching.** `RegistryTool` ranks shops by
-  keyword overlap in-process - no embedding call, no extra round trip,
-  before any merchant is even contacted.
-- **Small LLM turns.** The Buyer Agent's own reasoning calls are capped at
-  `LLM_MAX_OUTPUT_TOKENS=128` - it only ever needs to emit one short JSON
-  decision per iteration, never a long completion.
+    D --> E{"User confirms purchase?"}
+    E -->|"no / wants other shop"| C1
+    E -->|"user silent / abandons chat"| E1["status stays WAITING_FOR_USER<br/>no checkout call ever made"]
+    E -->|"yes"| F["🚦 Checkout call to merchant"]
 
-## The human-in-the-loop checkout gate
+    F --> G{"Order created OK?"}
+    G -->|"merchant rejects (stock changed etc.)"| G1["Relay failure,<br/>offer alternatives"]
+    G -->|"yes"| H["Return payment link, status=COMPLETED"]
 
-Same idea as `TransactionOrchestrator.authorization_check()` on the
-merchant side: one fixed, named call site
-(`Executor._require_checkout_authorized`) that the LLM cannot route
-around. `state.chat.awaiting_confirmation` is set True only by
-`PRESENT_OFFERS` and cleared the instant a checkout actually proceeds - so
-a `CHECKOUT` decision the very first turn ("just buy whatever iPhone is
-cheapest, don't ask") is deterministically blocked, regardless of what the
-LLM decided. See `tests/smoke_full_flow.py` for a passing end-to-end run,
-including this gate being tripped and recovered from.
+    H --> I{"User later says 'I paid'"}
+    I --> J["Buyer agent asks merchant to confirm<br/>payment status before treating order as final"]
+    J -->|"merchant confirms"| K["Order fully confirmed"]
+    J -->|"merchant says not received"| K1["Tell user payment not yet reflected,<br/>suggest waiting/retrying"]
 
-## Registry
-
-`POST /registry` accepts the manifest exactly as a shop's `AgentInfo` page
-hands it out:
-
-```json
-{ "name": "...", "description": "...", "agentUrl": "...", "authToken": "...", "contactPhone": "..." }
+    style A1 fill:#fef3c7
+    style A2 fill:#fef3c7
+    style B1 fill:#fecaca
+    style B2 fill:#fecaca
+    style C1 fill:#fed7aa
+    style C2 fill:#fed7aa
+    style E1 fill:#e5e7eb
+    style G1 fill:#fecaca
+    style F fill:#fecaca,stroke:#dc2626,stroke-width:2px
+    style K fill:#bbf7d0
+    style K1 fill:#fef3c7
 ```
 
-The auth token is encrypted with a server-side Fernet key
-(`REGISTRY_ENCRYPTION_KEY`) the instant it's saved, and no API response -
-`POST /registry`, `GET /registry`, or anything else - ever includes it
-again, encrypted or not. `RegistryService.resolve_for_call()` is the only
-method in the whole service that ever decrypts a token, and it does so
-immediately before that one outbound call.
+Key fallback principles:
 
-`GET /registry` / `DELETE /registry/{id}` never return or touch
-conversation data - registry and chat are fully separate endpoints backed
-by separate state, per the UI requirement.
+1. **Never guess.** If the merchant is ambiguous or missing, the buyer agent always asks the user rather than picking one — the same rule applies to the merchant agent for stock/price (it must call `CheckStockTool`/`GetPriceTool` rather than let the LLM invent a number).
+2. **Checkout is the only irreversible step, so it's the only step gated by an explicit human "yes."** Every other branch (search, compare, ask again) can happen freely without confirmation.
+3. **Payment confirmation is asymmetric.** The buyer agent hands the user a payment link but does not consider the order settled until the merchant agent itself confirms payment — this avoids the buyer agent falsely telling the user "you're done" based only on its own state.
+4. **Failures are reported, not swallowed.** Network/timeout/auth errors on either side surface to the user as a message rather than as silent retries, so the user always knows why nothing happened.
 
-## Running it
+-----
 
-Requires a Postgres database.
-
-```bash
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-
-cp .env.example .env
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-# paste that into REGISTRY_ENCRYPTION_KEY in .env, set GEMINI_API_KEY,
-# and point DATABASE_URL at your Postgres instance, e.g.:
-#   createuser buyer_agent -P
-#   createdb buyer_agent -O buyer_agent
-#   DATABASE_URL=postgresql+psycopg://buyer_agent:<password>@localhost:5432/buyer_agent
-
-uvicorn main:app --reload --port 8010
+## 2. 🟠 Buyer Agent — instruction set
+ 
+```mermaid
+flowchart TD
+    ROOT["🟠 Buyer Agent System Instructions"]
+    ROOT --> I1["1️⃣ Identity & Job<br/>'You are a shopping assistant acting on the user's behalf'"]
+    ROOT --> I2["2️⃣ Information-gathering rule<br/>'Never contact a merchant until you know WHAT and WHICH SHOP'"]
+    ROOT --> I3["3️⃣ Registry-first rule<br/>'Only contact merchants that exist in the registry — never invent a shop'"]
+    ROOT --> I4["4️⃣ Comparison rule<br/>'When multiple shops match, query them in parallel and compare fairly'"]
+    ROOT --> I5["5️⃣ Faithful relay rule<br/>'Summarize what a merchant actually said — never fabricate price/stock'"]
+    ROOT --> I6["6️⃣ 🚦 Human-in-the-loop rule<br/>'NEVER call checkout without an explicit yes from the user'"]
+    ROOT --> I7["7️⃣ Payment-confirmation rule<br/>'Do not mark an order complete until the merchant confirms payment'"]
+    ROOT --> I8["8️⃣ Transparency rule<br/>'Keep each merchant's transcript separate and inspectable (merchantThreads)'"]
+ 
+    style ROOT fill:#fed7aa,stroke:#c2410c,stroke-width:3px
+    style I1 fill:#fef3c7
+    style I2 fill:#fef9c3
+    style I3 fill:#fefce8
+    style I4 fill:#ecfccb
+    style I5 fill:#d1fae5
+    style I6 fill:#fecaca,stroke:#dc2626,stroke-width:2px
+    style I7 fill:#fed7aa
+    style I8 fill:#e0e7ff
 ```
-
-Tables (`merchants`, `chats`, `chat_messages`, `merchant_threads`,
-`transcript_lines`) are auto-created on startup via
-`Base.metadata.create_all()` - fine for development. For anything you'd
-call production, replace that with Alembic migrations; the ORM models in
-`app/persistence/models.py` are the source of truth either way.
-
-## Real merchant-agent-core interop
-
-I ran this against the *actual*, unmodified Gateway from
-`Sachin-MR05/Ecommerce-App`'s `merchant-agent-core` - real
-`app/gateway/routes.py`, real `AgentRequest`/`AgentResponse` contracts,
-real `DevAuthenticationService`, real `InMemoryRateLimiter`, real error
-handlers - with only the LLM+Java-Tool-Layer-dependent
-`AgentOrchestrator` swapped for a scripted stand-in (Gemini/HuggingFace/
-OpenAI and the Java backend all need network access this sandbox doesn't
-have). That surfaced one real bug: this client was sending
-`"channel": "buyer-agent"`, but the merchant gateway's
-`validate_incoming_message` only accepts `{web, mobile, api, voice,
-chat}` - every checkout call was silently 400'ing. Fixed to
-`"channel": "api"` (see `MerchantClient.send`).
-
-With that fix, a full search -> contact -> present offers -> user
-confirms -> checkout -> payment link -> user says paid -> payment
-verified run passed against the real gateway, and a second, independent
-process reload of the chat from Postgres reproduced the full 10-message
-history and merchant transcript correctly - not just an in-process
-assertion.
-
-**Not yet verified against the real thing:** the actual LLM-driven
-reasoning inside `MerchantAgent` (search_products/get_price/etc. tool
-calls through the Java backend), since that needs infrastructure this
-sandbox can't reach. The wire protocol - the part that determines whether
-two independently built agents can talk at all - is confirmed compatible.
-
-## Smoke test
-
-```bash
-PYTHONPATH=. python tests/smoke_full_flow.py
-```
-
-Spins up a fake merchant agent on `127.0.0.1:9999` implementing the real
-wire contract, drives the Buyer Agent through registry -> search -> contact
--> present offers -> user confirms -> checkout -> payment link -> user says
-paid -> payment verified, using a scripted LLM so the run is deterministic.
-Prints every turn's response and asserts on the terminal states.
-
-## What's not built yet
-
-- **The chat/registry frontend** — see `buyer-agent-frontend/` (separate
-  delivery), built and verified to compile against this API shape.
-- **Real auth on `/buyer/chat`** - `user_id` is currently hardcoded to
-  `"demo-user"`; wire it to whatever session/JWT your ecommerce app already
-  uses.
-- **A real payment link.** As noted in the design doc, the current merchant
-  repo writes a local `payment_page.html` rather than returning a hosted
-  URL - fine on one machine, not once buyer and merchant run separately.
-- **Verified LLM-driven merchant reasoning.** Only the wire protocol was
-  tested against the real merchant-agent-core (see above) - the actual
-  search/pricing/inventory tool-calling loop inside it wasn't exercised.
+ 
+### Why each instruction exists
+ 
+| # | Instruction | Why it's given |
+|---|---|---|
+| 1 | Identity: "shopping assistant acting on the user's behalf" | Anchors every downstream decision to *whose interest* the agent optimizes for — the user's, not a merchant's. This is what stops the agent from, e.g., pushing whichever shop replies fastest. |
+| 2 | Don't contact a merchant without knowing what + which shop | This is why the very first turn in the example transcript is a clarifying question instead of a guess — the instruction explicitly forbids the LLM from resolving ambiguity by assumption. |
+| 3 | Registry-first, never invent a shop | Prevents the LLM from hallucinating a plausible-sounding `agentUrl` — every merchant contact must be traceable to a real, user-approved registry entry with a real auth token. |
+| 4 | Parallel comparison for multiple matches | Encodes fairness and efficiency: the agent is instructed to give the user a real comparison rather than defaulting to the first shop it thinks of. |
+| 5 | Faithful relay, no fabrication | The agent is a middleman handling real prices — this instruction is what turns the merchant's raw reply ("The iPhone 12 is available for 45000 INR...") into the user-facing summary without ever changing the number. |
+| 6 | Human-in-the-loop before checkout | The single most load-bearing instruction in the whole system. Checkout is irreversible (creates a real order, generates a real payment link), so this is enforced as a hard gate, not a suggestion the LLM can talk itself out of. |
+| 7 | Don't mark complete until merchant confirms payment | Stops the agent from prematurely telling the user "you're done" based only on having *sent* a payment link — completion is defined by the merchant's confirmation, not the buyer agent's optimism. |
+| 8 | Keep per-merchant transcripts inspectable | Lets the user (or a developer) audit exactly what was said to each shop — critical for trust when an agent is negotiating and spending on your behalf. |
+ 
+---
